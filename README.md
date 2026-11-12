@@ -38,6 +38,9 @@ A managed database service that gives each tenant its own isolated SQLite databa
 | Secrets and encryption | KMS, Secrets Manager |
 | Monitoring | CloudWatch, X-Ray |
 
+### Diagram
+![architecture](docs/media-files/architecture.png)
+
 ## Roadmap
 
 - **P1 — Schema migrations:** versioned migration registry, per-tenant `schema_migrations` tracking, parallel fan-out with canary rollout, pre-migration snapshots, and rollback.
