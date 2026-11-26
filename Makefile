@@ -1,4 +1,4 @@
-# CDK commands for the worker cluster. Run from the repo root with your venv active.
+# CDK commands for the worker cluster. Run from the repo root with your venv active and the AWS CDK CLI (`cdk`) installed.
 
 CLUSTER_INFRA_DIR := worker-cluster/infra
 CLUSTER_CDK := cd $(CLUSTER_INFRA_DIR) && cdk
