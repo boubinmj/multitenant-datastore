@@ -1,3 +1,5 @@
 .env
 .sf/
 *.venv
+__pycache__/
+cdk.out/
