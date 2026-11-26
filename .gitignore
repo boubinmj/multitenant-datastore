@@ -1,3 +1,6 @@
 .env
 .sf/
 *.venv
+__pycache__/
+cdk.out/
+worker-cluster/infra/cdk.context.json
