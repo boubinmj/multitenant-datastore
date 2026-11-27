@@ -1,0 +1,15 @@
+# Ruff linter config for the whole repo. Run locally with: ruff check .
+target-version = "py312"
+line-length = 100
+extend-exclude = ["cdk.out", ".venv"]
+
+[lint]
+# E/F: pycodestyle errors + pyflakes (unused imports, undefined names, ...)
+# I:   import sorting
+select = ["E", "F", "I"]
+# Long lines are a formatting question, not a bug; leave them to `ruff format` if adopted.
+ignore = ["E501"]
+
+[lint.isort]
+# Our own packages, so they're grouped after third-party imports.
+known-first-party = ["app", "worker_cluster"]
