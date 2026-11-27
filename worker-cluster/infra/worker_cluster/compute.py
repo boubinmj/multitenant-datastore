@@ -35,6 +35,7 @@ class WorkerService(Construct):
         network: WorkerNetwork,
         bucket: s3.IBucket,
         placement_table: dynamodb.ITable,
+        tenants_table: dynamodb.ITable,
     ) -> None:
         super().__init__(scope, construct_id)
 
@@ -91,6 +92,15 @@ class WorkerService(Construct):
                 resources=[placement_table.table_arn],
             )
         )
+        # Status reads for the ACTIVE guard. UpdateItem is only for the stand-in tenant
+        # registration in POST /tenants/{id}; drop it once the control plane creates tenants.
+        self.task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="TenantStatus",
+                actions=["dynamodb:GetItem", "dynamodb:UpdateItem"],
+                resources=[tenants_table.table_arn],
+            )
+        )
 
         task_definition = ecs.FargateTaskDefinition(
             self,
@@ -116,12 +126,15 @@ class WorkerService(Construct):
                 platform=ecr_assets.Platform.LINUX_AMD64,
             ),
             port_mappings=[ecs.PortMapping(container_port=API_PORT)],
-            # Read by PlacementConfig.from_env(). Add PLACEMENT_*_ATTR here if the real
-            # table's attribute names differ from the service defaults.
+            # Read by PlacementConfig.from_env() and TenantsConfig.from_env(). Add
+            # PLACEMENT_*_ATTR / TENANTS_*_ATTR here if the real tables' attribute names
+            # differ from the service defaults. Regions are each table's own, which is
+            # correct even for a table imported by ARN.
             environment={
                 "PLACEMENT_TABLE_NAME": placement_table.table_name,
-                # The table's own region: correct even for a table imported by ARN.
                 "PLACEMENT_TABLE_REGION": placement_table.env.region,
+                "TENANTS_TABLE_NAME": tenants_table.table_name,
+                "TENANTS_TABLE_REGION": tenants_table.env.region,
             },
             logging=ecs.LogDrivers.aws_logs(stream_prefix="worker", log_group=log_group),
         )

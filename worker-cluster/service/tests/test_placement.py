@@ -1,63 +1,12 @@
-"""Lease protocol tests against an in-memory DynamoDB (moto). No AWS account needed."""
+"""Lease protocol tests against an in-memory DynamoDB (moto). Fixtures are in conftest.py."""
 
-import boto3
 import pytest
-from moto import mock_aws
 
-from app.placement import (
-    LeaseConflict,
-    LeaseLost,
-    PlacementClient,
-    PlacementConfig,
-)
+from app.placement import LeaseConflict, LeaseLost, PlacementClient, PlacementConfig
 
 REGION = "us-east-2"
 LEASE_SECONDS = 30
 LEASE_MS = LEASE_SECONDS * 1000
-
-
-class Clock:
-    def __init__(self) -> None:
-        self.now_ms = 1_000_000
-
-    def __call__(self) -> int:
-        return self.now_ms
-
-    def advance(self, ms: int) -> None:
-        self.now_ms += ms
-
-
-@pytest.fixture(autouse=True)
-def fake_aws_credentials(monkeypatch):
-    for name, value in {
-        "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_SESSION_TOKEN": "testing",
-        "AWS_DEFAULT_REGION": REGION,
-    }.items():
-        monkeypatch.setenv(name, value)
-
-
-def make_client(config: PlacementConfig, clock: Clock) -> PlacementClient:
-    ddb = boto3.client("dynamodb", region_name=REGION)
-    ddb.create_table(
-        TableName=config.table_name,
-        KeySchema=[{"AttributeName": config.key_attr, "KeyType": "HASH"}],
-        AttributeDefinitions=[{"AttributeName": config.key_attr, "AttributeType": "S"}],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    return PlacementClient(config, dynamodb_client=ddb, clock_ms=clock)
-
-
-@pytest.fixture
-def clock():
-    return Clock()
-
-
-@pytest.fixture
-def placement(clock):
-    with mock_aws():
-        yield make_client(PlacementConfig(table_name="placement", region=REGION), clock)
 
 
 def test_first_acquire_starts_at_epoch_1(placement, clock):
@@ -124,7 +73,7 @@ def test_tenants_are_independent(placement):
     assert (a.epoch, b.epoch) == (1, 1)
 
 
-def test_attribute_names_come_from_config(clock):
+def test_attribute_names_come_from_config(ddb, clock):
     # Simulates pointing at a real table whose attributes are named differently.
     config = PlacementConfig(
         table_name="cp-placement",
@@ -134,13 +83,19 @@ def test_attribute_names_come_from_config(clock):
         epoch_attr="ownerEpoch",
         lease_attr="leaseUntilMs",
     )
-    with mock_aws():
-        client = make_client(config, clock)
-        lease = client.acquire("acme", "task-a", LEASE_SECONDS)
-        item = client._ddb.get_item(TableName="cp-placement", Key={"tenantId": {"S": "acme"}})["Item"]
-        assert item["ownerTask"] == {"S": "task-a"}
-        assert item["ownerEpoch"] == {"N": "1"}
-        assert int(item["leaseUntilMs"]["N"]) == lease.lease_until_ms
+    ddb.create_table(
+        TableName=config.table_name,
+        KeySchema=[{"AttributeName": config.key_attr, "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": config.key_attr, "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    client = PlacementClient(config, dynamodb_client=ddb, clock_ms=clock)
+
+    lease = client.acquire("acme", "task-a", LEASE_SECONDS)
+    item = ddb.get_item(TableName="cp-placement", Key={"tenantId": {"S": "acme"}})["Item"]
+    assert item["ownerTask"] == {"S": "task-a"}
+    assert item["ownerEpoch"] == {"N": "1"}
+    assert int(item["leaseUntilMs"]["N"]) == lease.lease_until_ms
 
 
 def test_config_from_env(monkeypatch):
