@@ -43,6 +43,7 @@ from app.placement import (
     PlacementClient,
     get_placement_client,
 )
+from app.replication import ReplicationConfig, Replicator
 from app.tenants import ACTIVE, TenantCatalog, get_tenant_catalog
 
 log = logging.getLogger("worker")
@@ -78,6 +79,10 @@ def _error(status: int, code: str, message: str) -> HTTPException:
 _leases: dict[str, Lease] = {}
 _leases_guard = threading.Lock()
 
+# Litestream replication of owned tenants to S3. None when no bucket is configured
+# (local docker compose, tests).
+_replicator: Replicator | None = None
+
 
 def _held_lease(tenant_id: str) -> Lease | None:
     with _leases_guard:
@@ -91,8 +96,12 @@ def _store_lease(lease: Lease) -> None:
 
 def _drop_lease(lease: Lease) -> None:
     with _leases_guard:
-        if _leases.get(lease.tenant_id) == lease:
+        dropped = _leases.get(lease.tenant_id) == lease
+        if dropped:
             del _leases[lease.tenant_id]
+    # Not the owner any more: stop writing to S3 right away.
+    if dropped and _replicator is not None:
+        _replicator.stop(lease.tenant_id)
 
 
 def _locally_valid(lease: Lease, placement: PlacementClient) -> bool:
@@ -134,6 +143,12 @@ def renew_all(placement: PlacementClient) -> None:
         else:
             _store_lease(renewed)
 
+    if _replicator is not None:
+        # Restart crashed replicators, stop ones for tenants no longer held.
+        with _leases_guard:
+            held_now = dict(_leases)
+        _replicator.reconcile(held_now)
+
 
 def _heartbeat(placement: PlacementClient, stop: threading.Event) -> None:
     while not stop.wait(RENEW_INTERVAL_SECONDS):
@@ -150,6 +165,13 @@ async def lifespan(_app: FastAPI):
 
         create_local_tables(placement, catalog)
 
+    global _replicator
+    replication_config = ReplicationConfig.from_env(DATA_DIR)
+    if replication_config is None:
+        log.warning("TENANT_BUCKET_NAME not set: tenant databases are NOT replicated to S3")
+    else:
+        _replicator = Replicator(replication_config, kms_key_for=catalog.kms_key_id)
+
     log.info("worker task id %s", TASK_ID)
     stop = threading.Event()
     thread = threading.Thread(
@@ -161,6 +183,9 @@ async def lifespan(_app: FastAPI):
     finally:
         stop.set()
         thread.join(timeout=5)
+        # Final sync of every tenant to S3 while we still own them, then release.
+        if _replicator is not None:
+            _replicator.stop_all()
         # The files die with this task, so let another task take over right away.
         with _leases_guard:
             held = list(_leases.values())
@@ -317,6 +342,9 @@ def create_tenant(
             conn.execute("PRAGMA journal_mode=WAL")
         finally:
             conn.close()
+
+        if _replicator is not None:
+            _replicator.start(lease)
     return {"tenant_id": tenant_id, "owner_task": TASK_ID, "epoch": lease.epoch}
 
 

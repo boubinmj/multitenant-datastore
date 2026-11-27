@@ -25,8 +25,7 @@ worker-cluster/
   - Interface endpoints: ECR API, ECR Docker registry and CloudWatch Logs.
 - **Storage** A private bucket encrypted with the AWS managed key (`aws/s3`), which only accepts HTTPS requests. Keys are laid out like this:
   ```
-  tenants/{tenant_id}/gen-{epoch}/snapshots/
-  tenants/{tenant_id}/gen-{epoch}/wal/
+  tenants/{tenant_id}/gen-{epoch}/ltx/...   (written by Litestream, see Replication)
   migrations/v{n}/
   ```
   A lifecycle rule deletes objects tagged `generation-state=retired` after 30 days.
@@ -63,6 +62,59 @@ All of these use conditional writes, so two tasks can never both own a tenant.
 1. In [worker_cluster_stack.py](infra/worker_cluster/worker_cluster_stack.py), replace `ControlPlaneStandins(...)` with `dynamodb.Table.from_table_name(...)` for each table, or `from_table_arn(...)` if a table is in another region or account. Then delete `infra/worker_cluster/control_plane_standins.py`.
 2. If the real tables use different attribute names, add `PLACEMENT_KEY_ATTR`, `PLACEMENT_OWNER_ATTR`, `PLACEMENT_EPOCH_ATTR`, `PLACEMENT_LEASE_ATTR`, `TENANTS_KEY_ATTR` or `TENANTS_STATUS_ATTR` to the container environment in [compute.py](infra/worker_cluster/compute.py).
 3. Once the control plane assigns owners and creates tenants, `POST /tenants/{id}` should stop acquiring the lease and registering the tenant itself (see below). Then remove `dynamodb:UpdateItem` from the `TenantStatus` policy.
+
+### Replication (Litestream)
+
+The worker copies every tenant it owns to S3 continuously with [Litestream](https://litestream.io) v0.5.18. Changes are pushed about once a second to `s3://<tenant bucket>/tenants/{id}/gen-{epoch}/`. Code: [service/app/replication.py](service/app/replication.py).
+
+#### Dynamic configuration: how it works
+
+**The problem.** Tenants are added and removed while the task is running, and each tenant needs its own S3 path (its `gen-{epoch}`) and possibly its own KMS key. Litestream reads its config file once at startup and can't reload it. Its directory-watch mode (`dir:` + `watch: true`) does pick up new files, but it uses **one** replica path and **one** KMS key for the whole directory, so it can't do per-tenant paths or keys.
+
+**The approach: one Litestream process per tenant, managed by the worker.** Each process is a child of the worker in the same container, not a separate sidecar container.
+
+| Event | What the worker does |
+|---|---|
+| Tenant created on this task (`POST /tenants/{id}`) | Writes `/data/litestream/{id}.yml` and starts `litestream replicate -config /data/litestream/{id}.yml` |
+| Lease lost (failed renew, takeover, or found expired by a request) | Sends SIGTERM to that tenant's process **right away** and deletes its config. The process is reaped later; the request isn't held up |
+| Epoch changes | Stops the old process and starts a new one pointed at the new `gen-{epoch}` |
+| Every heartbeat (10 s) | Reconciles: starts processes for held leases that have none (or whose process crashed), stops processes for tenants no longer held, and kills processes that ignored SIGTERM for 35 s |
+| Task shutdown | SIGTERM to every process, then waits for Litestream's final sync (up to 30 s). Only then are leases released. The container's stop timeout is 60 s to allow for this |
+
+Each per-tenant config file looks like this (JSON, which is valid YAML):
+
+```json
+{"dbs": [{"path": "/data/tenants/acme.db",
+          "replica": {"type": "s3", "bucket": "<tenant bucket>", "path": "tenants/acme/gen-3",
+                      "region": "us-east-2", "sync-interval": "1s",
+                      "sse-kms-key-id": "<key, if any>"}}]}
+```
+
+**Why one process per tenant.** It's the only setup that gives each tenant its own path and key without restarting replication for *every* tenant whenever one changes. Stopping one process is also the most direct way to make a stale owner stop writing to S3. The cost is one process per tenant, so how many tenants fit in a 512 MiB task still needs to be measured.
+
+**Fencing.** Each owner writes only under its own `gen-{epoch}`. If an old owner's process hasn't exited yet, its last writes go to the old generation and can never mix with the new owner's.
+
+#### Encryption keys (per-tenant KMS)
+
+The worker picks each tenant's key in this order:
+
+1. The tenant's own key: the `kms_key_arn` attribute on its `tenants` item (the attribute name can be changed with `TENANTS_KMS_KEY_ATTR`).
+2. A default key: `LITESTREAM_DEFAULT_KMS_KEY_ID` in the container environment.
+3. Neither: the bucket's default encryption (the AWS managed `aws/s3` key).
+
+**Who creates per-tenant keys hasn't been decided.** The worker code doesn't depend on that decision. Today no keys exist, so backups use option 3. When keys are introduced, the task role also needs `kms:GenerateDataKey` and `kms:Decrypt` on them. No KMS VPC endpoint is needed, because S3 calls KMS on the worker's behalf.
+
+#### Settings
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TENANT_BUCKET_NAME` | set by CDK | Bucket to replicate to. **If unset, replication is off** (for example under `docker compose`) |
+| `TENANT_BUCKET_REGION` | set by CDK | Bucket region |
+| `LITESTREAM_SYNC_INTERVAL` | `1s` | How often changes are pushed |
+| `LITESTREAM_DEFAULT_KMS_KEY_ID` | unset | Fallback KMS key |
+| `LITESTREAM_CONFIG_DIR` | `/data/litestream` | Where per-tenant config files are written |
+
+Litestream's retention deletes old files, so the task role has `s3:DeleteObject` on `tenants/*`.
 
 ### Worker API
 
@@ -217,7 +269,9 @@ cdk destroy
 
 ### Known limitations
 
-- **Tenant databases are lost when the task is replaced** (deploy, crash or restart). The `.db` files live on the task's temporary disk, and nothing uploads snapshots or WAL segments to S3 yet.
+- **Backups exist, but nothing restores them yet.** Litestream copies each tenant to S3, but when a task takes over a tenant it starts with an empty database instead of restoring the previous generation. Until restore-on-acquire exists, a replaced task still means the tenant's data isn't available on the new task, though it's safe in S3.
+- **Replication doesn't run locally.** `docker compose` sets no bucket, so replication is off.
+- **Litestream's behavior on SIGTERM isn't fully confirmed.** Its docs say it does a final sync on "a shutdown signal" without naming which signals. Check the logs on the first real shutdown.
 - **No access from outside the VPC.** There's no load balancer or public endpoint yet.
 - **One task, one AZ.** No high availability, and there's an outage during each deploy.
 - **No authentication on the API.** Anything inside the VPC can call it.

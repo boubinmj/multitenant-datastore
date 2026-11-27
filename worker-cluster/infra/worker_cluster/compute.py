@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from aws_cdk import RemovalPolicy
+from aws_cdk import Duration, RemovalPolicy
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecr_assets as ecr_assets
@@ -57,6 +57,8 @@ class WorkerService(Construct):
                 actions=[
                     "s3:GetObject",
                     "s3:PutObject",
+                    # Litestream's retention deletes compacted/old LTX files.
+                    "s3:DeleteObject",
                     "s3:GetObjectTagging",
                     "s3:PutObjectTagging",
                 ],
@@ -80,6 +82,15 @@ class WorkerService(Construct):
                         "s3:prefix": [f"{TENANTS_PREFIX}*", f"{MIGRATIONS_PREFIX}*"]
                     }
                 },
+            )
+        )
+
+        # Litestream looks up the bucket's region (listed in its S3 permission guide).
+        self.task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="BucketLocation",
+                actions=["s3:GetBucketLocation"],
+                resources=[bucket.bucket_arn],
             )
         )
 
@@ -135,7 +146,14 @@ class WorkerService(Construct):
                 "PLACEMENT_TABLE_REGION": placement_table.env.region,
                 "TENANTS_TABLE_NAME": tenants_table.table_name,
                 "TENANTS_TABLE_REGION": tenants_table.env.region,
+                # Litestream replicates each owned tenant to tenants/{id}/gen-{epoch}/ here.
+                # Optional: LITESTREAM_DEFAULT_KMS_KEY_ID for tenants without their own key.
+                "TENANT_BUCKET_NAME": bucket.bucket_name,
+                "TENANT_BUCKET_REGION": bucket.env.region,
             },
+            # Time for the shutdown hook: Litestream's final sync (up to 30s) per tenant,
+            # in parallel, then lease release. ECS sends SIGKILL after this.
+            stop_timeout=Duration.seconds(60),
             logging=ecs.LogDrivers.aws_logs(stream_prefix="worker", log_group=log_group),
         )
 
