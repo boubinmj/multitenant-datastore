@@ -7,6 +7,7 @@ The worker cluster stores each tenant's data in its own SQLite file and runs SQL
 | CL-01 | Private network: VPC, one private subnet in one AZ, VPC endpoints | [infra/worker_cluster/network.py](infra/worker_cluster/network.py) |
 | CL-02 | S3 bucket for tenant snapshots, WAL segments and migrations | [infra/worker_cluster/storage.py](infra/worker_cluster/storage.py), [storage_layout.py](infra/worker_cluster/storage_layout.py) |
 | CL-03 | Worker HTTP API running as one ECS Fargate task | [service/](service/), [infra/worker_cluster/compute.py](infra/worker_cluster/compute.py) |
+| (temporary) | Stand-in `placement` table until CP-01 creates the real one | [infra/worker_cluster/placement.py](infra/worker_cluster/placement.py), [service/app/placement.py](service/app/placement.py) |
 
 ### Layout
 
@@ -29,6 +30,33 @@ worker-cluster/
   ```
   A lifecycle rule deletes objects tagged `generation-state=retired` after 30 days.
 - **Worker service (CL-03).** One Fargate task (0.25 vCPU, 512 MiB) in the private subnet, with no public IP. Port 8080 accepts traffic only from inside the VPC. The task role can read and write `tenants/*` and can only read `migrations/*`. Logs go to CloudWatch and are kept for one week.
+
+### Placement table (temporary)
+
+Each query task needs to know whether it owns a tenant. The control plane's `placement` table records this (CP-01, see the architecture diagram). Until that table exists, this stack creates a stand-in DynamoDB table with the same shape. The deployed task reaches it through the DynamoDB gateway endpoint and is allowed only `GetItem` and `UpdateItem`.
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `tenant_id` | S | Partition key |
+| `owner_task` | S | Owning task's ID; absent when nobody owns the tenant |
+| `epoch` | N | +1 on every acquire; never reset. Matches `gen-{epoch}` in S3 |
+| `lease_until` | N | Lease expiry, Unix time in milliseconds |
+
+This protocol is a **proposal** and still needs to be agreed with the control plane owner.
+
+Worker code goes through `get_placement_client()` in [service/app/placement.py](service/app/placement.py), which provides:
+
+- `acquire(tenant, task)`: succeeds only if nobody owns the tenant or the lease has expired. Increments the epoch.
+- `renew(lease)`: succeeds only if the owner and epoch are unchanged and the lease hasn't expired.
+- `release(lease)`: clears the owner but keeps the epoch.
+- `holds(lease)`: the per-request guard.
+
+All of these use conditional writes, so two tasks can never both own a tenant.
+
+**Switching to the real table.** Nothing in the worker code names the table directly. To switch:
+
+1. In [worker_cluster_stack.py](infra/worker_cluster/worker_cluster_stack.py), replace `PlacementTable(...)` with `dynamodb.Table.from_table_name(...)`, or `from_table_arn(...)` if the table is in another region or account. Then delete `infra/worker_cluster/placement.py`.
+2. If the real table uses different attribute names, add `PLACEMENT_KEY_ATTR`, `PLACEMENT_OWNER_ATTR`, `PLACEMENT_EPOCH_ATTR` or `PLACEMENT_LEASE_ATTR` to the container environment in [compute.py](infra/worker_cluster/compute.py).
 
 ### Worker API
 

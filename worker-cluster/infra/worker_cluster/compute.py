@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from aws_cdk import RemovalPolicy
+from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import aws_ecs as ecs
@@ -33,6 +34,7 @@ class WorkerService(Construct):
         *,
         network: WorkerNetwork,
         bucket: s3.IBucket,
+        placement_table: dynamodb.ITable,
     ) -> None:
         super().__init__(scope, construct_id)
 
@@ -80,6 +82,16 @@ class WorkerService(Construct):
             )
         )
 
+        # Lease reads and conditional writes only (service/app/placement.py). Reached
+        # through the DynamoDB gateway endpoint from CL-01.
+        self.task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="PlacementLeases",
+                actions=["dynamodb:GetItem", "dynamodb:UpdateItem"],
+                resources=[placement_table.table_arn],
+            )
+        )
+
         task_definition = ecs.FargateTaskDefinition(
             self,
             "TaskDef",
@@ -104,6 +116,13 @@ class WorkerService(Construct):
                 platform=ecr_assets.Platform.LINUX_AMD64,
             ),
             port_mappings=[ecs.PortMapping(container_port=API_PORT)],
+            # Read by PlacementConfig.from_env(). Add PLACEMENT_*_ATTR here if the real
+            # table's attribute names differ from the service defaults.
+            environment={
+                "PLACEMENT_TABLE_NAME": placement_table.table_name,
+                # The table's own region: correct even for a table imported by ARN.
+                "PLACEMENT_TABLE_REGION": placement_table.env.region,
+            },
             logging=ecs.LogDrivers.aws_logs(stream_prefix="worker", log_group=log_group),
         )
 

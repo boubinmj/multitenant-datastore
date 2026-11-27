@@ -4,3 +4,7 @@
 __pycache__/
 cdk.out/
 worker-cluster/infra/cdk.context.json
+.venv/
+.pytest_cache/
+*/__pycache__/
+*/.pytest_cache/
