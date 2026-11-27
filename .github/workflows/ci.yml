@@ -15,3 +15,25 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: pip check
+
+  test:
+    # One job per suite, so a failure shows which suite broke.
+    name: pytest (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - worker-cluster/service  # API, leases, guards (moto: no AWS account needed)
+          - worker-cluster/infra    # CDK synth assertions (no Docker or AWS needed)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # The CDK Python library runs on Node.js (jsii); ubuntu-latest has it installed.
+      - run: pip install -r requirements.txt
+      - name: Run tests
+        working-directory: ${{ matrix.suite }}
+        run: pytest
