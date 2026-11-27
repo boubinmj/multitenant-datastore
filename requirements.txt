@@ -5,4 +5,5 @@ moto[all]>=5.0,<6.0
 aws-cdk-lib==2.278.0
 constructs>=10.0.0,<11.0.0
 -r worker-cluster/service/requirements.txt
-httpx>=0.27,<1.0
+# starlette.testclient (used by fastapi.testclient) needs httpx2; plain httpx is deprecated there.
+httpx2
