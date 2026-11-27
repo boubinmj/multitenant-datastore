@@ -1,0 +1,24 @@
+# Local smoke test: the worker plus DynamoDB Local standing in for the control-plane tables.
+#   cd worker-cluster/service && docker compose up --build
+# Data is in memory on both sides and gone after `docker compose down`.
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest  # default command runs in memory
+
+  worker:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PLACEMENT_TABLE_NAME: placement
+      PLACEMENT_ENDPOINT_URL: http://dynamodb:8000
+      TENANTS_TABLE_NAME: tenants
+      TENANTS_ENDPOINT_URL: http://dynamodb:8000
+      # Creates both tables in DynamoDB Local at startup (never in AWS: see app/local_dev.py).
+      CREATE_LOCAL_TABLES: "1"
+      # DynamoDB Local accepts any credentials and region.
+      AWS_REGION: us-east-2
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    depends_on:
+      - dynamodb
