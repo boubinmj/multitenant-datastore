@@ -15,3 +15,37 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: pip check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Only Ruff, at the version range pinned in requirements.txt: no need for the full install.
+      - run: pip install "$(grep '^ruff' requirements.txt)"
+      # GitHub output format puts each problem as an annotation on the PR's diff.
+      - run: ruff check --output-format=github .
+
+  test:
+    # One job per suite, so a failure shows which suite broke.
+    name: pytest (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - worker-cluster/service  # API, leases, guards (moto: no AWS account needed)
+          - worker-cluster/infra    # CDK synth assertions (no Docker or AWS needed)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # The CDK Python library runs on Node.js (jsii); ubuntu-latest has it installed.
+      - run: pip install -r requirements.txt
+      - name: Run tests
+        working-directory: ${{ matrix.suite }}
+        run: pytest
