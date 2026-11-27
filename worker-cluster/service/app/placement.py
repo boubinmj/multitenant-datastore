@@ -109,6 +109,10 @@ class PlacementClient:
     def _key(self, tenant_id: str) -> dict:
         return {self.config.key_attr: {"S": tenant_id}}
 
+    def now_ms(self) -> int:
+        """The clock leases are judged by (injectable for tests)."""
+        return self._now_ms()
+
     def _lease_from_item(self, tenant_id: str, item: dict) -> Lease:
         c = self.config
         return Lease(

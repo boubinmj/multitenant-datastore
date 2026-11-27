@@ -77,7 +77,12 @@ Errors look like `{"detail": {"code": "WRONG_OWNER", "message": "..."}}`. The ro
 **Guards on every `/execute` request**, in this order:
 
 1. **Validated tenant ID.** It must match `[A-Za-z0-9_-]{1,64}`, and the file path is built only from it.
-2. **Lease + epoch.** This task must hold the tenant's lease at the current epoch (a strongly consistent read of `placement`). A background thread renews held leases every 10 s; each lease lasts 30 s. Leases are released on shutdown.
+2. **Lease + epoch.** This task must hold the tenant's lease at the current epoch. The lease is checked three times:
+   - locally first, against the task's own copy of `lease_until` minus a 2 s margin for clock differences, with no network call;
+   - then with a strongly consistent read of `placement`;
+   - and again after the request takes the tenant lock.
+
+   **Heartbeat:** a background thread renews held leases every 10 s, and each lease lasts 30 s. Each renewal is a conditional write on owner + epoch. If it fails, the lease is dropped at once and the tenant gets `409` from then on. If DynamoDB can't be reached, the task keeps the lease while it's still valid and gives it up once it expires. Leases are released on shutdown.
 3. **ACTIVE.** The tenant's status in `tenants` must be `ACTIVE`.
 4. **`mode=rw` open.** SQLite opens the file read-write and never creates it, so a missing file is an error rather than a new, empty database.
 5. **Authorizer.** It denies `ATTACH`/`DETACH`, `load_extension`, and every `PRAGMA` except read-only introspection (`table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`). No databases can be attached at all, which also blocks `VACUUM INTO`.
@@ -101,6 +106,7 @@ Errors look like `{"detail": {"code": "WRONG_OWNER", "message": "..."}}`. The ro
 | 409 | `WRONG_OWNER` | This task doesn't hold the tenant's lease at the current epoch. The router should look up the owner again and retry |
 | 409 | `TENANT_EXISTS` | `POST /tenants/{id}` for a tenant this task already has |
 | 413 | `DB_SIZE_LIMIT` | The write would make the database larger than `MAX_DB_BYTES` |
+| 503 | `PLACEMENT_UNAVAILABLE` | DynamoDB can't be reached, so ownership can't be confirmed. Safe to retry |
 
 Other rules:
 
