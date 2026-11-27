@@ -4,6 +4,8 @@ Guards on every /execute request, in order:
 
 1. Tenant ID must match an allowlist. The file path is built only from that ID.
 2. This task must hold the tenant's lease at the current epoch, else 409 WRONG_OWNER.
+   Checked locally first (lease_until minus a safety margin, no network needed), then
+   against DynamoDB (503 if unreachable), and again after taking the tenant lock.
 3. Tenant status must be ACTIVE, else 403 TENANT_NOT_ACTIVE.
 4. The file is opened with mode=rw, which never creates a file.
 5. The SQLite authorizer denies ATTACH/DETACH, load_extension and any PRAGMA not on an
@@ -54,6 +56,9 @@ TENANT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 TASK_ID = os.environ.get("WORKER_TASK_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 LEASE_SECONDS = 30
 RENEW_INTERVAL_SECONDS = 10
+# Stop serving this long before our own view of lease_until, to allow for clock skew
+# between this task and whoever decides the lease has expired.
+LEASE_SAFETY_MARGIN_MS = 2000
 
 BUSY_TIMEOUT_SECONDS = 5
 STATEMENT_TIMEOUT_SECONDS = float(os.environ.get("STATEMENT_TIMEOUT_SECONDS", "5"))
@@ -90,8 +95,27 @@ def _drop_lease(lease: Lease) -> None:
             del _leases[lease.tenant_id]
 
 
+def _locally_valid(lease: Lease, placement: PlacementClient) -> bool:
+    """Our own view: is the lease still safely inside lease_until? Needs no network."""
+    return placement.now_ms() < lease.lease_until_ms - LEASE_SAFETY_MARGIN_MS
+
+
+def _still_held(tenant_id: str, lease: Lease, placement: PlacementClient) -> bool:
+    """Same owner and epoch as `lease`, and locally unexpired. Renewals may have replaced
+    the stored lease with a later lease_until, so compare epochs, not whole leases."""
+    current = _held_lease(tenant_id)
+    return (
+        current is not None
+        and current.epoch == lease.epoch
+        and _locally_valid(current, placement)
+    )
+
+
 def renew_all(placement: PlacementClient) -> None:
-    """Renew every held lease once. Drops leases this task no longer owns."""
+    """Renew every held lease once (conditional on owner + epoch).
+
+    A failed renew drops the lease at once, so the tenant stops being served.
+    """
     with _leases_guard:
         held = list(_leases.values())
     for lease in held:
@@ -101,9 +125,12 @@ def renew_all(placement: PlacementClient) -> None:
             log.warning("lost lease on %s at epoch %s", lease.tenant_id, lease.epoch)
             _drop_lease(lease)
         except Exception:
-            # Network trouble: keep trying. If it lasts past expiry, the guard rejects
-            # requests and the next renew raises LeaseLost.
+            # Network trouble: keep the lease while it's still valid and retry next
+            # round. Once it has expired, renew can't succeed anyway, so give it up.
             log.exception("renewing lease on %s failed", lease.tenant_id)
+            if not _locally_valid(lease, placement):
+                log.warning("lease on %s expired while renewals failed", lease.tenant_id)
+                _drop_lease(lease)
         else:
             _store_lease(renewed)
 
@@ -213,19 +240,37 @@ def _apply_limits(conn: sqlite3.Connection) -> None:
 # ---- request guard ------------------------------------------------------------------
 
 
-def _guard(tenant_id: str, placement: PlacementClient, catalog: TenantCatalog) -> Path:
+def _wrong_owner() -> HTTPException:
+    return _error(409, "WRONG_OWNER", "this task does not own the tenant")
+
+
+def _guard(
+    tenant_id: str, placement: PlacementClient, catalog: TenantCatalog
+) -> tuple[Path, Lease]:
     path = _db_path(tenant_id)
 
+    # Local check first: an expired lease is refused even if DynamoDB is unreachable.
     lease = _held_lease(tenant_id)
-    if lease is None or not placement.holds(lease):
+    if lease is None or not _locally_valid(lease, placement):
         if lease is not None:
             _drop_lease(lease)
-        raise _error(409, "WRONG_OWNER", "this task does not own the tenant")
+        raise _wrong_owner()
 
-    if catalog.get_status(tenant_id) != ACTIVE:
+    try:
+        holds = placement.holds(lease)
+        status = catalog.get_status(tenant_id)
+    except Exception:
+        # Can't confirm ownership, so don't serve. Not WRONG_OWNER: we may still own it.
+        log.exception("placement/tenants lookup failed for %s", tenant_id)
+        raise _error(503, "PLACEMENT_UNAVAILABLE", "cannot verify tenant ownership") from None
+
+    if not holds:
+        _drop_lease(lease)
+        raise _wrong_owner()
+    if status != ACTIVE:
         raise _error(403, "TENANT_NOT_ACTIVE", "tenant is not active")
 
-    return path
+    return path, lease
 
 
 # ---- routes -----------------------------------------------------------------------
@@ -282,8 +327,11 @@ def execute(
     placement: PlacementClient = Depends(get_placement_client),
     catalog: TenantCatalog = Depends(get_tenant_catalog),
 ) -> dict:
-    path = _guard(tenant_id, placement, catalog)
+    path, lease = _guard(tenant_id, placement, catalog)
     with _lock_for(tenant_id):
+        # The lease may have been lost while this request waited for the lock.
+        if not _still_held(tenant_id, lease, placement):
+            raise _wrong_owner()
         try:
             conn = _open(path, create=False)
         except sqlite3.OperationalError:

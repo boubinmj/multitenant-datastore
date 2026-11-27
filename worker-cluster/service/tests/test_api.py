@@ -102,6 +102,100 @@ def test_heartbeat_drops_lost_lease(client, placement, clock):
     assert "acme" not in main._leases
 
 
+def _reassign_in_dynamodb(ddb, placement, tenant_id, new_owner):
+    """Simulate the placement controller moving the tenant: new owner, epoch + 1."""
+    ddb.update_item(
+        TableName=placement.config.table_name,
+        Key={"tenant_id": {"S": tenant_id}},
+        UpdateExpression="SET #owner = :o ADD #epoch :one",
+        ExpressionAttributeNames={"#owner": "owner_task", "#epoch": "epoch"},
+        ExpressionAttributeValues={":o": {"S": new_owner}, ":one": {"N": "1"}},
+    )
+
+
+def test_failed_renew_stops_serving_immediately(client, placement, ddb):
+    client.post("/tenants/acme")
+    _reassign_in_dynamodb(ddb, placement, "acme", "task-other")
+
+    main.renew_all(placement)  # conditional write on epoch fails
+    assert "acme" not in main._leases
+    assert code(run(client, "acme", "SELECT 1")) == "WRONG_OWNER"
+
+
+def test_reassignment_seen_on_next_request_even_before_renew(client, placement, ddb):
+    client.post("/tenants/acme")
+    _reassign_in_dynamodb(ddb, placement, "acme", "task-other")
+    assert code(run(client, "acme", "SELECT 1")) == "WRONG_OWNER"
+    assert "acme" not in main._leases
+
+
+def test_stops_serving_inside_safety_margin(client, clock):
+    client.post("/tenants/acme")
+    clock.advance(LEASE_MS - main.LEASE_SAFETY_MARGIN_MS)
+    assert code(run(client, "acme", "SELECT 1")) == "WRONG_OWNER"
+
+
+def test_expired_lease_refused_without_dynamodb(client, placement, clock, monkeypatch):
+    client.post("/tenants/acme")
+    clock.advance(LEASE_MS + 1)
+
+    def unreachable(_lease):
+        raise ConnectionError("dynamodb down")
+
+    monkeypatch.setattr(placement, "holds", unreachable)
+    assert code(run(client, "acme", "SELECT 1")) == "WRONG_OWNER"
+
+
+def test_dynamodb_unreachable_with_valid_lease_is_503(client, placement, monkeypatch):
+    client.post("/tenants/acme")
+
+    def unreachable(_lease):
+        raise ConnectionError("dynamodb down")
+
+    monkeypatch.setattr(placement, "holds", unreachable)
+    resp = run(client, "acme", "SELECT 1")
+    assert resp.status_code == 503
+    assert code(resp) == "PLACEMENT_UNAVAILABLE"
+    assert "acme" in main._leases  # may still own it; keep renewing
+
+
+def test_lease_lost_while_waiting_for_lock(client, monkeypatch):
+    client.post("/tenants/acme")
+    real_lock_for = main._lock_for
+
+    class LoseLeaseOnEnter:
+        """Passes the guard, then the heartbeat drops the lease before the lock is taken."""
+
+        def __init__(self, tenant_id):
+            self.lock = real_lock_for(tenant_id)
+
+        def __enter__(self):
+            main._leases.pop("acme", None)
+            return self.lock.__enter__()
+
+        def __exit__(self, *exc):
+            return self.lock.__exit__(*exc)
+
+    monkeypatch.setattr(main, "_lock_for", LoseLeaseOnEnter)
+    assert code(run(client, "acme", "SELECT 1")) == "WRONG_OWNER"
+
+
+def test_heartbeat_keeps_lease_through_brief_outage(client, placement, clock, monkeypatch):
+    client.post("/tenants/acme")
+
+    def unreachable(_lease, _seconds):
+        raise ConnectionError("dynamodb down")
+
+    monkeypatch.setattr(placement, "renew", unreachable)
+    clock.advance(main.RENEW_INTERVAL_SECONDS * 1000)
+    main.renew_all(placement)
+    assert "acme" in main._leases  # still valid: keep it and retry
+
+    clock.advance(LEASE_MS)
+    main.renew_all(placement)
+    assert "acme" not in main._leases  # expired during the outage: give it up
+
+
 # ---- ACTIVE status ------------------------------------------------------------------
 
 
