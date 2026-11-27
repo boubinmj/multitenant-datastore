@@ -81,3 +81,44 @@ def test_api_port_open_only_inside_vpc(template):
             ]
         },
     )
+
+
+def test_litestream_can_delete_tenant_objects_for_retention(template):
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": Match.array_with(
+                    [
+                        Match.object_like(
+                            {
+                                "Sid": "TenantDataReadWrite",
+                                "Action": Match.array_with(["s3:DeleteObject"]),
+                            }
+                        )
+                    ]
+                )
+            }
+        },
+    )
+
+
+def test_container_gets_bucket_and_time_for_final_sync(template):
+    template.has_resource_properties(
+        "AWS::ECS::TaskDefinition",
+        {
+            "ContainerDefinitions": [
+                Match.object_like(
+                    {
+                        "StopTimeout": 60,
+                        "Environment": Match.array_with(
+                            [
+                                Match.object_like({"Name": "TENANT_BUCKET_NAME"}),
+                                Match.object_like({"Name": "TENANT_BUCKET_REGION"}),
+                            ]
+                        ),
+                    }
+                )
+            ]
+        },
+    )

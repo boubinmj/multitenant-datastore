@@ -74,6 +74,7 @@ def client(tmp_path, monkeypatch, placement, catalog):
     monkeypatch.setattr(main, "TASK_ID", "task-under-test")
     monkeypatch.setattr(main, "_leases", {})
     monkeypatch.setattr(main, "_locks", {})
+    monkeypatch.setattr(main, "_replicator", None)
     main.app.dependency_overrides[get_placement_client] = lambda: placement
     main.app.dependency_overrides[get_tenant_catalog] = lambda: catalog
     # Not used as a context manager, so the lifespan (env-based clients, heartbeat) doesn't run.

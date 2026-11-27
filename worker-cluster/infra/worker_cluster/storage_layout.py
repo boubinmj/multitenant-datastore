@@ -7,6 +7,11 @@ Plain Python with no CDK imports, so worker and controller code can import it to
     migrations/v{n}/
 
 S3 has no real folders; these prefixes exist once objects are written under them.
+
+NOTE: Litestream v0.5 (service/app/replication.py) replicates to the generation prefix
+and lays out its own files under it, as LTX files in an `ltx/` folder, not in `snapshots/`
+or `wal/`. Only generation_prefix() matches what is actually written today. The
+service keeps its own copy of that prefix, because its Docker image can't import infra.
 """
 
 TENANTS_PREFIX = "tenants/"
