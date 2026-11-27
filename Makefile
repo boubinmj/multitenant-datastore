@@ -5,17 +5,17 @@ CLUSTER_CDK := cd $(CLUSTER_INFRA_DIR) && cdk
 
 .PHONY: cdk-synth cdk-bootstrap cdk-diff cdk-deploy cdk-destroy
 
-cdk-synth:
+cluster-synth:
 	$(CLUSTER_CDK) synth
 
-cdk-bootstrap:
+cluster-bootstrap:
 	$(CLUSTER_CDK) bootstrap
 
-cdk-diff:
+cluster-diff:
 	$(CLUSTER_CDK) diff
 
-cdk-deploy:
+cluster-deploy:
 	$(CLUSTER_CDK) deploy
 
-cdk-destroy:
+cluster-destroy:
 	$(CLUSTER_CDK) destroy
